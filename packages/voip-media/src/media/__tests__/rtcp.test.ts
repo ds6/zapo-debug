@@ -7,9 +7,11 @@ import {
     buildPictureLossIndication,
     buildReceiverEstimatedMaxBitrate,
     buildSenderReportWithSdes,
+    nextAudioReceiverEstimate,
     nextReceiverMaxBitrate,
     RtpStreamReception,
-    SenderReportSchedule
+    SenderReportSchedule,
+    senderReportSourceSsrc
 } from '../rtcp.js'
 
 const REPORT_BLOCK_OFFSET = 28
@@ -705,6 +707,21 @@ test('scopes the loss fraction to the interval while the loss count stays cumula
     assert.equal(second.packetsLost, 1, 'the earlier loss stays in the cumulative count')
 })
 
+test('takes the interval loss apart from the interval the sender report consumes', () => {
+    const reception = new RtpStreamReception(AUDIO_CLOCK_RATE)
+    assert.equal(reception.takeLossPercent(), 0, 'nothing received yet')
+    observeRun(reception, 100, 10, [105])
+    assert.ok(Math.abs(reception.takeLossPercent() - 10) < 1e-9)
+    assert.equal(
+        reception.report(0).fractionLost,
+        Math.floor(256 / 10),
+        'the sender report keeps its own interval'
+    )
+    observeRun(reception, 110, 10)
+    assert.equal(reception.takeLossPercent(), 0, 'a clean interval after a lossy one')
+    assert.equal(reception.takeLossPercent(), 0, 'an interval with nothing expected')
+})
+
 test('saturates the loss fraction at the width of its field', () => {
     const reception = new RtpStreamReception(AUDIO_CLOCK_RATE)
     reception.observe(PEER_SSRC, 100, 0, 0)
@@ -1152,4 +1169,95 @@ test('keeps the announced ceiling inside the floor and the cap', () => {
     )
     assert.equal(nextReceiverMaxBitrate(10_000, 0, REMB_WINDOW_MS, 0), REMB_MIN_BITRATE)
     assert.equal(nextReceiverMaxBitrate(100_000, 0, 0, 0), 150_000, 'an unmeasurable window grows')
+})
+
+/** UAQC thresholds of the audio `<voip_settings>` the estimate is placed against. */
+const UAQC_PROBING_REMB_THRESHOLD = 22_000
+const UAQC_BANDWIDTH_MANAGED_REMB_UPPER = 24_000
+const UAQC_HIGH_QUALITY_TARGET = 25_000
+/** Floor and ceiling of the audio estimate. */
+const AUDIO_REMB_MIN_BITRATE = 16_000
+const AUDIO_REMB_MAX_BITRATE = 30_000
+const AUDIO_REMB_INITIAL_BITRATE = 24_000
+
+test('the audio estimate opens above the bitrate UAQC needs to leave probing', () => {
+    assert.equal(nextAudioReceiverEstimate(0, 0), AUDIO_REMB_INITIAL_BITRATE)
+    assert.equal(nextAudioReceiverEstimate(0, 50), AUDIO_REMB_INITIAL_BITRATE)
+    assert.ok(AUDIO_REMB_INITIAL_BITRATE >= UAQC_PROBING_REMB_THRESHOLD)
+})
+
+test('the audio estimate climbs 10% per clean interval and settles on its ceiling', () => {
+    assert.equal(nextAudioReceiverEstimate(AUDIO_REMB_INITIAL_BITRATE, 0), 26_400)
+    assert.equal(nextAudioReceiverEstimate(26_400, 1.9), 29_040)
+
+    let estimate = nextAudioReceiverEstimate(0, 0)
+    for (let interval = 0; interval < 20; interval++) {
+        const next = nextAudioReceiverEstimate(estimate, 0)
+        assert.ok(next >= estimate, 'a clean interval never lowers it')
+        estimate = next
+    }
+    assert.equal(estimate, AUDIO_REMB_MAX_BITRATE)
+    assert.equal(nextAudioReceiverEstimate(estimate, 0), estimate, 'no trend once settled')
+})
+
+test('one backoff from the ceiling stays above the high-quality target and managed band', () => {
+    const backedOff = nextAudioReceiverEstimate(AUDIO_REMB_MAX_BITRATE, 10)
+    assert.ok(backedOff > UAQC_HIGH_QUALITY_TARGET)
+    assert.ok(backedOff > UAQC_BANDWIDTH_MANAGED_REMB_UPPER)
+    assert.ok(
+        nextAudioReceiverEstimate(backedOff, 10) < UAQC_BANDWIDTH_MANAGED_REMB_UPPER,
+        'a second lossy interval does reach the managed band'
+    )
+})
+
+test('the audio estimate holds on intermediate loss and backs off from 10%', () => {
+    assert.equal(nextAudioReceiverEstimate(30_000, 2), 30_000)
+    assert.equal(nextAudioReceiverEstimate(30_000, 9.9), 30_000)
+    assert.equal(nextAudioReceiverEstimate(30_000, 10), 25_500)
+    assert.equal(nextAudioReceiverEstimate(30_000, 40), 25_500)
+})
+
+test('the audio estimate never drops below 16 kbps however heavy the loss', () => {
+    let estimate = AUDIO_REMB_MAX_BITRATE
+    for (let interval = 0; interval < 30; interval++) {
+        estimate = nextAudioReceiverEstimate(estimate, 90)
+        assert.ok(estimate >= AUDIO_REMB_MIN_BITRATE)
+    }
+    assert.equal(estimate, AUDIO_REMB_MIN_BITRATE)
+})
+
+test('a compound packet that opens with a sender report names the source it describes', () => {
+    const report = buildSenderReportWithSdes(0xdeadbeef, 10, 100, 960)
+    const remb = buildReceiverEstimatedMaxBitrate(0x11111111, 0x22222222, 30_000)
+
+    assert.equal(senderReportSourceSsrc(report), 0xdeadbeef)
+    assert.equal(senderReportSourceSsrc(remb), null)
+    assert.equal(senderReportSourceSsrc(report.subarray(0, 27)), null)
+})
+
+test('a REMB lists every source a group estimate covers, and one source stays the 1:1 shape', () => {
+    const many = buildReceiverEstimatedMaxBitrate(0x11111111, [0x0a0a0a03, 0x0b0b0b03], 300_000)
+    const one = buildReceiverEstimatedMaxBitrate(0x11111111, 0x0a0a0a03, 300_000)
+
+    assert.equal(many.length, one.length + 4)
+    assert.equal(readUInt16BE(many, 2), many.length / 4 - 1)
+    assert.equal(many[16], 2)
+    assert.deepEqual([readUInt32BE(many, 20), readUInt32BE(many, 24)], [0x0a0a0a03, 0x0b0b0b03])
+    assert.deepEqual(
+        buildReceiverEstimatedMaxBitrate(0x11111111, [0x0a0a0a03], 300_000),
+        one,
+        'a list of one is the single-source packet'
+    )
+})
+
+/** The compound may hold enough bytes while the sender report itself declares too few. */
+test('a sender report whose own length is short or overruns the compound names no source', () => {
+    const short = new Uint8Array(40)
+    short.set([0x80, 200, 0x00, 0x01, 0xde, 0xad, 0xbe, 0xef])
+    short.set([0x81, 202, 0x00, 0x07], 8)
+    const overrun = buildSenderReportWithSdes(0xdeadbeef, 10, 100, 960).slice(0, 40)
+    overrun[3] = 0x20
+
+    assert.equal(senderReportSourceSsrc(short), null)
+    assert.equal(senderReportSourceSsrc(overrun), null)
 })

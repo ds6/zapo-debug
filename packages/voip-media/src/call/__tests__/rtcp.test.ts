@@ -88,7 +88,6 @@ interface PlaneInternals {
     videoReception: RtpStreamReception
     videoReportSchedule: SenderReportSchedule
     receiverEstimateSchedule: SenderReportSchedule
-    wallSendTimeExtension: boolean
     onRelayData: (data: Uint8Array) => void
 }
 
@@ -175,8 +174,13 @@ async function createPlane(
 function fixedFrameCodec(samplesPerPacket: number): MLowCodec {
     return {
         getFrameSize: () => samplesPerPacket,
-        encode: () => OPUS_FRAME,
+        encodeInto: (_frame: Float32Array, target: Uint8Array) => {
+            target.set(OPUS_FRAME)
+            return OPUS_FRAME.length
+        },
         resetSequence: () => {},
+        decodeSequenced: () => {},
+        setExpectedPacketLossPercent: () => {},
         getStats: () => ({ success: 0, errors: 0 }),
         destroy: () => {}
     } as unknown as MLowCodec
@@ -659,43 +663,7 @@ function extensionElement(data: Uint8Array, id: number): Uint8Array | null {
     return null
 }
 
-/** WhatsApp Web's id 9: wall ms / 16, 12 bits. */
-function wallSendTime16(nowMs: number): number {
-    return Math.floor(nowMs / 16) & 0x0fff
-}
-
-test('with the send-time extension, audio and video carry id 9 as the wall clock on one clock', async (t) => {
-    t.mock.timers.enable({ apis: ['Date'], now: 1_790_888_642_787 })
-    const video = await createPlane('video')
-    const audio = await createPlane('audio')
-    video.internals.wallSendTimeExtension = true
-    audio.internals.wallSendTimeExtension = true
-
-    sendVideoFrame(video)
-    sendAudioFrame(audio)
-
-    const expected = wallSendTime16(Date.now())
-    const [videoPacket] = rtpPacketsFrom(video.sent, SELF_VIDEO_SSRC)
-    const [audioPacket] = rtpPacketsFrom(audio.sent, SELF_AUDIO_SSRC)
-    assert.deepEqual(
-        [...(extensionElement(videoPacket.header.extensionData, 9) ?? [])],
-        [expected >> 8, expected & 0xff]
-    )
-    assert.deepEqual(
-        [...audioPacket.header.extensionData],
-        [0x91, expected >> 8, expected & 0xff, 0]
-    )
-
-    t.mock.timers.tick(1_600)
-    sendVideoFrame(video)
-    const later = rtpPacketsFrom(video.sent, SELF_VIDEO_SSRC).at(-1)
-    const id9 = extensionElement(later!.header.extensionData, 9)!
-    assert.equal(((id9[0] << 8) | id9[1]) - expected, 100, '1.6 s is 100 units of 16 ms')
-    video.plane.stop()
-    audio.plane.stop()
-})
-
-test('without it, the video id 9 is the transport sequence and the audio carries no element', async () => {
+test('the video id 9 is the transport sequence and the audio carries no element', async () => {
     const video = await createPlane('video')
     const audio = await createPlane('audio')
 
@@ -711,4 +679,119 @@ test('without it, the video id 9 is the transport sequence and the audio carries
     assert.equal(rtpPacketsFrom(audio.sent, SELF_AUDIO_SSRC)[0].header.extensionData.length, 0)
     video.plane.stop()
     audio.plane.stop()
+})
+
+/** Spacing of the peer's audio packets, one 60 ms frame each. */
+const INBOUND_AUDIO_STEP_MS = 60
+
+/** An inbound audio RTP packet of the peer. */
+function inboundAudioPacket(sequenceNumber: number): Uint8Array {
+    const header = new RtpHeader(120, sequenceNumber, sequenceNumber * 960, PEER_AUDIO_SSRC)
+    return new RtpPacket(header, new Uint8Array([0x50, 1, 2, 3])).encode()
+}
+
+/**
+ * Feeds `count` peer audio packets from `fromSequence`, one every 60 ms, skipping the
+ * sequence numbers `lost` picks, and returns the REMBs sent with the time each left at.
+ */
+function receiveAudio(
+    harness: RtcpHarness,
+    fromSequence: number,
+    count: number,
+    lost: (sequence: number) => boolean = () => false
+): { readonly at: number; readonly packet: Uint8Array }[] {
+    const estimates: { at: number; packet: Uint8Array }[] = []
+    for (let sequence = fromSequence; sequence < fromSequence + count; sequence++) {
+        harness.time.ms += INBOUND_AUDIO_STEP_MS
+        if (lost(sequence)) continue
+        const before = harness.sent.length
+        harness.internals.onRelayData(inboundAudioPacket(sequence))
+        for (const packet of receiverEstimates(harness.sent.slice(before))) {
+            estimates.push({ at: harness.time.ms, packet })
+        }
+    }
+    return estimates
+}
+
+test('an audio call sends a REMB on the peer audio stream, byte for byte', async () => {
+    const harness = await createPlane('audio')
+
+    const [first] = receiveAudio(harness, 1, 40)
+
+    assert.ok(first, 'the audio receive path emits a REMB')
+    assert.deepEqual(
+        first.packet,
+        Uint8Array.from([
+            0x8f, 206, 0x00, 0x05, 0x11, 0x11, 0x11, 0x11, 0x00, 0x00, 0x00, 0x00, 0x52, 0x45, 0x4d,
+            0x42, 0x01, 0x00, 0x5d, 0xc0, 0x33, 0x33, 0x33, 0x33
+        ]),
+        'PSFB FMT 15 from our audio ssrc, REMB, one ssrc, 24000 as exponent 0, the peer audio ssrc'
+    )
+    harness.plane.stop()
+})
+
+test('the audio REMB goes out once per RTCP interval of the call', async () => {
+    const harness = await createPlane('audio')
+
+    const estimates = receiveAudio(harness, 1, 175)
+    const opened = CLOCK_START_MS + INBOUND_AUDIO_STEP_MS
+
+    assert.ok(estimates.length >= 6 && estimates.length <= 7, `${estimates.length} in 10.5 s`)
+    let previous = opened
+    for (const { at } of estimates) {
+        const gap = at - previous
+        assert.ok(
+            gap >= REPORT_INTERVAL_MS * (1 - REPORT_INTERVAL_JITTER) &&
+                gap <= REPORT_INTERVAL_MS * (1 + REPORT_INTERVAL_JITTER) + INBOUND_AUDIO_STEP_MS,
+            `REMBs ${gap} ms apart`
+        )
+        previous = at
+    }
+    harness.plane.stop()
+})
+
+test('the audio REMB climbs to its ceiling on a clean stream and holds it there', async () => {
+    const harness = await createPlane('audio')
+
+    const bitrates = receiveAudio(harness, 1, 400).map(({ packet }) => rembBitrate(packet))
+
+    assert.deepEqual(bitrates.slice(0, 4), [24_000, 26_400, 29_040, 30_000])
+    assert.ok(bitrates.length > 10)
+    for (const bitrate of bitrates.slice(4)) {
+        assert.equal(bitrate, 30_000, 'a steady value gives the peer no trend to follow')
+    }
+    harness.plane.stop()
+})
+
+test('the audio REMB backs off under 20% loss and stops at 16 kbps', async () => {
+    const harness = await createPlane('audio')
+
+    const bitrates = receiveAudio(harness, 1, 300, (sequence) => sequence % 5 === 0).map(
+        ({ packet }) => rembBitrate(packet)
+    )
+
+    assert.ok(bitrates.length >= 10)
+    for (let index = 1; index < bitrates.length; index++) {
+        assert.ok(bitrates[index] <= bitrates[index - 1], 'every lossy interval lowers or holds it')
+        assert.ok(bitrates[index] >= 16_000)
+    }
+    assert.equal(bitrates.at(-1), 16_000)
+
+    const recovered = receiveAudio(harness, 301, 200).map(({ packet }) => rembBitrate(packet))
+    assert.ok(recovered.at(-1)! > 16_000, 'a clean stretch climbs back')
+    harness.plane.stop()
+})
+
+test('the video REMB gate does not silence the audio REMB', async () => {
+    const harness = await createPlane('audio')
+    await harness.plane.apply({
+        settings: {
+            rtcpIntervalMs: REPORT_INTERVAL_MS,
+            disableRtcpRemb: true,
+            appDataSframe: false
+        }
+    })
+
+    assert.ok(receiveAudio(harness, 1, 40).length > 0, 'vid_rc.disable_rtcp_remb is video only')
+    harness.plane.stop()
 })
