@@ -334,9 +334,7 @@ function shouldEmitIncomingMessage(message: proto.IMessage): boolean {
     if (!pickDirectSenderKeyDistributionPayload(message)) {
         return true
     }
-
     const messageRecord = message as Record<string, unknown>
-
     for (const field in messageRecord) {
         if (
             field === 'senderKeyDistributionMessage' ||
@@ -346,16 +344,12 @@ function shouldEmitIncomingMessage(message: proto.IMessage): boolean {
         ) {
             continue
         }
-
         const value = messageRecord[field]
-
         if (value === null || value === undefined) {
             continue
         }
-
         return true
     }
-
     return false
 }
 
@@ -626,8 +620,8 @@ export async function handleIncomingMessageAck(
     if (Array.isArray(nodeContent) && nodeContent.length > 0) {
         const senderJid = node.attrs.participant ?? node.attrs.from
         let hasSuccessfulDecrypt = false
-        let hasApplicationMessage = false
         let firstDecryptFailure: DecryptEncNodeResult | null = null
+        let skmsgFailure: DecryptEncNodeResult | null = null
         let encCount = 0
         let firstEncType: string | undefined
 
@@ -715,11 +709,9 @@ export async function handleIncomingMessageAck(
             }
             if (result.success) {
                 hasSuccessfulDecrypt = true
-                if (result.encType === 'skmsg') {
-                    hasApplicationMessage = true
-                }
-            } else if (!firstDecryptFailure) {
-                firstDecryptFailure = result
+            } else {
+                firstDecryptFailure ??= result
+                if (child.attrs.type === 'skmsg') skmsgFailure ??= result
             }
         }
 
@@ -731,12 +723,13 @@ export async function handleIncomingMessageAck(
                 encCount
             })
         }
-        if (encCount > 0 && !hasApplicationMessage && firstDecryptFailure) {
+        const decryptFailure = skmsgFailure ?? firstDecryptFailure
+        if (decryptFailure && (!hasSuccessfulDecrypt || skmsgFailure)) {
             await sendRetryReceiptForDecryptFailure(
                 node,
                 options,
-                firstDecryptFailure.error,
-                firstDecryptFailure.encType
+                decryptFailure.error,
+                decryptFailure.encType
             )
             shouldSendStandardReceipt = false
         }
